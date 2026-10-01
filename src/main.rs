@@ -7,10 +7,50 @@ use std::{
 };
 
 use nix::unistd::{Gid, Uid, setgid, setuid};
-use yescrypt::{self, PasswordHasher, PasswordVerifier, Yescrypt};
+use yescrypt::{self, PasswordVerifier, Yescrypt};
 
-#[derive(Debug)]
-struct PasswdInfo {
+struct Credentials {
+    username: String,
+    password: String,
+}
+
+impl Credentials {
+    fn new() -> Result<Self> {
+        return Ok(Self {
+            username: Self::get_username()?,
+            password: Self::get_password()?,
+        });
+    }
+
+    fn input(message: &str, echo_off: bool) -> Result<String> {
+        print!("{message}");
+        stdout().flush()?;
+
+        if echo_off {
+            return Ok(rpassword::read_password()?);
+        }
+
+        let mut buffer = String::new();
+        stdin()
+            .read_line(&mut buffer)
+            .context("[ERROR] Failed to read input")?;
+        return Ok(buffer);
+    }
+
+    fn get_username() -> Result<String> {
+        if let Some(username) = env::args().nth(1) {
+            return Ok(username.trim().to_string());
+        } else {
+            return Self::input("username: ", false);
+        }
+    }
+
+    fn get_password() -> Result<String> {
+        return Self::input("password: ", true);
+    }
+}
+
+struct Envirorment {
     user: String,
     uid: u32,
     gid: u32,
@@ -18,7 +58,7 @@ struct PasswdInfo {
     shell: String,
 }
 
-impl PasswdInfo {
+impl Envirorment {
     fn new(user: String, uid: u32, gid: u32, home: String, shell: String) -> Self {
         Self {
             user,
@@ -36,7 +76,7 @@ impl PasswdInfo {
         //     env::set_var("SHELL", &self.shell);
         // }
 
-        // I will not run this on my main system because otherwise it would mess up with my actual env
+        // // I will not run this on my main system because otherwise it would mess up with my actual env
         // self.set_uid_gid()?;
 
         Ok(())
@@ -48,10 +88,38 @@ impl PasswdInfo {
 
         Ok(())
     }
+
+    pub fn get(username: &str) -> Result<Envirorment> {
+        let passwd_path = "/etc/passwd";
+        let passwd = read_to_string(passwd_path)?;
+
+        for line in passwd.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.first() == Some(&username) {
+                let uid = fields[2]
+                    .parse::<u32>()
+                    .context("[ERROR] Failed to convert uid to integer")?;
+
+                let gid = fields[3]
+                    .parse::<u32>()
+                    .context("[ERROR] Failed to convert gid to integer")?;
+
+                let user = fields[4].to_owned();
+
+                let home = fields[5].to_owned();
+                let shell = fields[6].to_owned();
+                // NOTE: The check for the bash in case is empty is useless
+                // because my os will always use RShell instead
+
+                return Ok(Envirorment::new(user, uid, gid, home, shell));
+            }
+        }
+
+        bail!("[ERROR] Username isn't inside passwd");
+    }
 }
 
-struct ShadowInfo {
-    username: String,
+struct PasswordInfo {
     hashed_password: String,
     // I would use this field later on currently, for this implementation i don't really need it
     // last_pass_change: u32,
@@ -62,24 +130,13 @@ struct ShadowInfo {
     // expiration_date: u32,
 }
 
-impl ShadowInfo {
-    fn new(username: &str, password: String) -> Result<Self> {
+impl PasswordInfo {
+    fn password_matches(&self, password: &[u8], stored_password: &str) -> Result<bool> {
         use yescrypt::password_hash::Error::PasswordInvalid;
         let yescrypt = Yescrypt::default();
 
-        let stored_password = Self::get_password_from_file(&username)?;
-        let current_password = password.as_bytes();
-
-        let hashed_password = yescrypt
-            .hash_password(&password.as_bytes())
-            .context("[ERROR] Failed to has current password")?
-            .to_string();
-
-        return match yescrypt.verify_password(current_password, stored_password.as_str()) {
-            Ok(_) => Ok(Self {
-                username: username.to_string(),
-                hashed_password,
-            }),
+        return match yescrypt.verify_password(password, stored_password) {
+            Ok(_) => Ok(true),
             Err(PasswordInvalid) => bail!("[ERROR] The inserted password is invalid"),
             Err(_) => bail!(
                 "[ERROR] An error has occured during the password verification between the stored and cirrent password"
@@ -87,13 +144,15 @@ impl ShadowInfo {
         };
     }
 
-    fn get_password_from_file(username: &str) -> Result<String> {
+    fn get(username: &str) -> Result<PasswordInfo> {
         let path = PathBuf::from("/etc/shadow");
         let file = read_to_string(path).context("[ERROR] Failed to open shadow file")?;
         for lines in file.lines() {
             let fields: Vec<&str> = lines.split(':').collect();
             if fields.first() == Some(&username) {
-                return Ok(fields[1].to_owned());
+                let hashed_password: String = fields[1].to_owned();
+
+                return Ok(Self { hashed_password });
             }
         }
 
@@ -101,67 +160,38 @@ impl ShadowInfo {
     }
 }
 
-fn input(message: &str, echo_off: bool) -> Result<String> {
-    print!("{message}");
-    stdout().flush()?;
-
-    if echo_off {
-        return Ok(rpassword::read_password()?);
-    }
-
-    let mut buffer = String::new();
-    stdin()
-        .read_line(&mut buffer)
-        .context("[ERROR] Failed to read input")?;
-    return Ok(buffer);
+struct User {
+    credentials: Credentials,
+    env: Envirorment,
+    pass_info: PasswordInfo,
 }
 
-fn get_user_env(username: &str) -> Result<PasswdInfo> {
-    let passwd_path = "/etc/passwd";
-    let passwd = read_to_string(passwd_path)?;
+impl User {
+    pub fn new() -> Result<Self> {
+        let credentials = Credentials::new()?;
+        let username = &credentials.username.clone();
 
-    for line in passwd.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.first() == Some(&username) {
-            let uid = fields[2]
-                .parse::<u32>()
-                .context("[ERROR] Failed to convert uid to integer")?;
-
-            let gid = fields[3]
-                .parse::<u32>()
-                .context("[ERROR] Failed to convert gid to integer")?;
-
-            let user = fields[4].to_owned();
-
-            let home = fields[5].to_owned();
-            let shell = fields[6].to_owned();
-            // NOTE: The check for the bash in case is empty is useless
-            // because my os will always use RShell instead
-
-            return Ok(PasswdInfo::new(user, uid, gid, home, shell));
-        }
+        return Ok(Self {
+            credentials,
+            env: Envirorment::get(username)?,
+            pass_info: PasswordInfo::get(username)?,
+        });
     }
 
-    bail!("[ERROR] Username isn't inside passwd");
+    pub fn login(&self) -> Result<()> {
+        let password = self.credentials.password.as_bytes();
+        let stored_password = &self.pass_info.hashed_password;
+
+        if self.pass_info.password_matches(password, stored_password)? {
+            self.env.apply()?;
+            println!("Everything went smoothly");
+            return Ok(());
+        } else {
+            bail!("[ERROR] Something went wrong: ")
+        }
+    }
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-
-    let username = &if args.len() > 1 {
-        &args[1]
-    } else {
-        &input("username: ", false)?
-    };
-    println!("{username}");
-
-    let password = input("password: ", true)?;
-
-    get_user_env(username)?.apply()?;
-
-    ShadowInfo::new(username, password)?;
-
-    print!("Password matches!");
-
-    Ok(())
+    User::new()?.login()
 }
