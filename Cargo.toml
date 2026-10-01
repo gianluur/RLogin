@@ -1,0 +1,10 @@
+[package]
+name = "rlogin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+nix = { version = "0.31.3", features = ["user"] }
+rpassword = "7.5.4"
+yescrypt = { version = "0.1.0", features = ["getrandom"] }
